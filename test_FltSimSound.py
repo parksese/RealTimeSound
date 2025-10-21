@@ -34,8 +34,8 @@ TEST_INPUT = {
     "spd": 67.0,
     "aoa": 0.0,
     "aos": 0.0,
-    "rpm": np.array([200, 200, 200, 200], dtype=float),
-    "collective": np.array([50, 50, 50, 50], dtype=float),
+    "rpm": np.array([168, 168, 168, 168], dtype=float),
+    "coll": np.array([50, 50, 50, 50], dtype=float),
     "tilt": np.array([0, 0, 0, 0], dtype=float)
 }
 
@@ -89,6 +89,10 @@ def audio_callback(outdata, frames, time_info, status):
         omega = rpm_filtered[rotor_id] * 2 * np.pi / 60
         if rpm_filtered[rotor_id] < 1e-2:
             continue
+        c = lookup.get_coefficients(spd=spd, aoa=aoa, aos=aos, coll=coll_filtered[rotor_id])
+        a0, a1, b1, a2, b2 = c["a0"], 
+        tilt_rad = 
+        trans_tilt = 
 
         # Simple sinusoidal lift model for demonstration
         for blade in range(NUMBER_OF_BLADES):
@@ -97,7 +101,11 @@ def audio_callback(outdata, frames, time_info, status):
             az_block = az_start + omega * dt * n
             azimuth[source_id] = az_block[-1]
 
-            L = np.sin(az_block) * coll_filtered[rotor_id]
+
+            if rotor_direction[rotor_id] == 1:
+                        L = (a0)
+            else:
+                        L = (a0)
 
             # Source position (before tilt)
             x = rotor_center[rotor_id][0] + ROTOR_RADIUS * np.cos(az_block)
@@ -107,9 +115,23 @@ def audio_callback(outdata, frames, time_info, status):
             
             r = observer_position - source_position
             rmag = np.linalg.norm(r, axis=1)
-            p_near = L / (rmag + 1e-6)
-            out_buffer[:, 0] += p_near * volume_gain
-            out_buffer[:, 1] += p_near * volume_gain
+
+            # Mach vector
+            M = 
+            Mi = 
+            Mi = 
+
+            # Force vector
+
+            # Dot products
+
+            # Pressure
+            p_near = 
+            # subtract
+            p_near -= np.mean(p_near)
+
+            out_buffer[:, 0] += p_near #* volume_gain
+            out_buffer[:, 1] += p_near #* volume_gain
 
     out_buffer *= SCALING_FACTOR
     outdata[:] = out_buffer
@@ -146,7 +168,11 @@ def start_plots():
             lines1[k].set_data(t_vals, list(plot_data[key]))
             axs1[k//2,k%2].set_xlim(max(0, t_vals[0]), t_vals[-1]+1e-6)
             axs1[k//2,k%2].set_ylim(min(plot_data[key])-1, max(plot_data[key])+1)
-        
+        axs1[0,0].set_ylim(-10, 100)        
+        axs1[0,1].set_ylim(-10, 100)
+        axs1[1,0].set_ylim(0,500)
+        axs1[1,1].set_ylim(-20,20)
+
         # waveform
         wave = np.array(plot_data["wave"])
         N = len(wave)
