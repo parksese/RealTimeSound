@@ -137,18 +137,77 @@ def plot_thread():
         ax_wave.set_ylim(-1, 1)
         plt.pause(0.05)
 
-# ---------------- Main ----------------
 def main():
-    # start plotting thread
-    threading.Thread(target=plot_thread, daemon=True).start()
+    global waveform_latest, current_values
+    waveform_latest = np.zeros(AUDIO_BLOCK_SIZE)
+    current_values = {"t": 0, "spd": 0, "tilt": 0, "rpm": 0, "aos": 0}
+    history = {"t": [], "spd": [], "tilt": [], "rpm": [], "aos": []}
+
+    # ---- Create figures in MAIN thread ----
+    plt.ion()
+    fig, axs = plt.subplots(2, 2, figsize=(10, 6))
+    axs = axs.flatten()
+    labels = ["spd", "tilt", "rpm", "aos"]
+    lines = {}
+    for i, label in enumerate(labels):
+        lines[label], = axs[i].plot([], [], label=label)
+        axs[i].set_title(label)
+        axs[i].set_xlim(0, 10)
+        axs[i].set_ylim(-10, 100)
+        axs[i].legend()
+
+    # waveform subplot (add inside same figure, bottom-right)
+    fig_wave, ax_wave = plt.subplots()
+    line_wave, = ax_wave.plot([], [])
+    ax_wave.set_title("Waveform (recent block)")
+    ax_wave.set_ylim(-1, 1)
 
     print("Starting audio stream...")
-    with sd.OutputStream(channels=AUDIO_CHANNELS,
-                         samplerate=AUDIO_SAMPLE_RATE,
-                         blocksize=AUDIO_BLOCK_SIZE,
-                         callback=audio_callback):
-        while True:
-            time.sleep(0.1)
+    stream = sd.OutputStream(
+        channels=AUDIO_CHANNELS,
+        samplerate=AUDIO_SAMPLE_RATE,
+        blocksize=AUDIO_BLOCK_SIZE,
+        callback=audio_callback
+    )
+    stream.start()
+
+    start_time = time.time()
+
+    # ---- Main update loop ----
+    try:
+        while plt.fignum_exists(fig.number):
+            with state_lock:
+                t = current_values["t"] - start_time
+                for k in ["spd", "tilt", "rpm", "aos"]:
+                    history[k].append(current_values[k])
+                history["t"].append(t)
+                wave_copy = waveform_latest.copy()
+
+            # Trim history
+            if len(history["t"]) > 200:
+                for key in history:
+                    history[key] = history[key][-200:]
+
+            # Update plots
+            for label in labels:
+                lines[label].set_data(history["t"], history[label])
+                axs[labels.index(label)].set_xlim(max(0, t - 10), t)
+
+            # Waveform update
+            ax_wave.cla()
+            ax_wave.set_title("Waveform (recent block)")
+            ax_wave.plot(wave_copy)
+            ax_wave.set_ylim(-1, 1)
+
+            plt.pause(0.05)
+
+    except KeyboardInterrupt:
+        print("Stopping...")
+    finally:
+        stream.stop()
+        stream.close()
+        plt.close("all")
+
 
 if __name__ == "__main__":
     main()
