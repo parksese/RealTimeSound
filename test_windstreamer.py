@@ -49,39 +49,44 @@ def load_wind_noise():
 
 # ---------------- Seamless loop class ----------------
 class WindStreamer:
-    """Efficient looping streamer for wind noise."""
-    def __init__(self, wind_data):
+    def __init__(self, wind_data, sample_rate=44100, crossfade_ms=50):
         self.wind_data = wind_data
         self.num_samples = len(wind_data)
         self.idx = 0
-        # Precompute fade shapes for runtime crossfade
-        self.fade_len = int(CROSSFADE_MS * AUDIO_SAMPLE_RATE / 1000)
+        self.sample_rate = sample_rate
+
+        # fade settings
+        self.fade_len = int(crossfade_ms * sample_rate / 1000)
         self.fade_in = np.linspace(0, 1, self.fade_len)
         self.fade_out = np.linspace(1, 0, self.fade_len)
 
+        # pre-buffer overlap region (used when looping)
+        self.overlap_buf = np.zeros((self.fade_len, 2), dtype=np.float32)
+
     def get_block(self, frames: int) -> np.ndarray:
-        """Return the next continuous block with seamless looping."""
+        """Return the next continuous block with seamless crossfaded looping."""
         out = np.zeros((frames, 2), dtype=np.float32)
-        start = 0
         remaining = frames
+        start = 0
 
         while remaining > 0:
+            # if remaining samples fit before loop boundary
             chunk = min(remaining, self.num_samples - self.idx)
             out[start:start+chunk] = self.wind_data[self.idx:self.idx+chunk]
             self.idx += chunk
             start += chunk
             remaining -= chunk
 
+            # if we reached the end, blend overlap
             if self.idx >= self.num_samples:
-                # apply smooth overlap crossfade at loop
                 overlap = min(self.fade_len, frames)
-                for ch in range(2):
-                    out[start-overlap:start, ch] = (
-                        out[start-overlap:start, ch] * self.fade_out[:overlap] +
-                        self.wind_data[:overlap, ch] * self.fade_in[:overlap]
-                    )
-                self.idx = 0
-
+                # fetch both tail and head
+                tail = self.wind_data[-overlap:]
+                head = self.wind_data[:overlap]
+                # overlap-add crossfade
+                blended = tail * self.fade_out[:overlap,None] + head * self.fade_in[:overlap,None]
+                out[start-overlap:start] = blended
+                self.idx = overlap  # continue from beginning
         return out
 
 # ---------------- Testing standalone playback ----------------
