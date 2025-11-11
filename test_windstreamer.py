@@ -112,3 +112,36 @@ if __name__ == "__main__":
                 sd.sleep(1000)
         except KeyboardInterrupt:
             print("Stopped.")
+            
+            
+            
+            
+class WindStreamer:
+    def __init__(self, data):
+        self.data = data
+        self.len = len(data)
+        self.idx = 0
+        self.fade_len = int(0.05 * AUDIO_SAMPLE_RATE)
+        self.fade_in = np.linspace(0, 1, self.fade_len)
+        self.fade_out = np.linspace(1, 0, self.fade_len)
+        self.next_offset = np.random.randint(0, self.len - self.fade_len)
+
+    def get_block(self, frames):
+        out = np.zeros((frames, 2), np.float32)
+        start = 0
+        while start < frames:
+            remain = frames - start
+            chunk = min(remain, self.len - self.idx)
+            out[start:start+chunk] = self.data[self.idx:self.idx+chunk]
+            self.idx += chunk
+            start += chunk
+            if self.idx >= self.len:
+                overlap = self.fade_len
+                tail = self.data[-overlap:]
+                new_head_start = self.next_offset
+                head = self.data[new_head_start:new_head_start+overlap]
+                blend = tail*self.fade_out[:,None] + head*self.fade_in[:,None]
+                out[start-overlap:start] = blend
+                self.idx = new_head_start + overlap
+                self.next_offset = np.random.randint(0, self.len - self.fade_len)
+        return out
