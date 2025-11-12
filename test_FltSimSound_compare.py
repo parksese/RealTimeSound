@@ -103,7 +103,7 @@ def generate_block(input_data, n_samples):
 
     return out_buffer
     
-    def write_tecplot(filename, pressure, sample_rate=AUDIO_SAMPLE_RATE):
+def write_tecplot(filename, pressure, sample_rate=AUDIO_SAMPLE_RATE):
     t = np.arange(len(pressure)) / sample_rate
 
     with open(filename, "w") as f:
