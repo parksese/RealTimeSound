@@ -1,5 +1,5 @@
 # ============================================================
-#  Real-time Broadband Noise Streaming + Live Plot
+#  Real-time Broadband Noise Streaming + Live Plot (thread-safe)
 # ============================================================
 
 import numpy as np
@@ -73,72 +73,82 @@ def compute_spl_db(p):
     return 20 * np.log10(np.sqrt(np.mean(p**2)) / p0 + 1e-20)
 
 
-# ------------------ Live Data Buffers ------------------
+# ------------------ Shared Buffers ------------------
 wave_buffer = deque(maxlen=N_window)
 freqs = rfftfreq(blocksize, 1/fs)
 spl_spectrum = np.zeros_like(freqs)
-spl_1_3 = None
-one_third_freqs = None
 oaspl = 0.0
 lock = threading.Lock()
 
-# ------------------ Parameters ------------------
+# ------------------ Broadband spectrum setup ------------------
 rpm = 470
 thrust_n = 1500.0
 cl_bar = 0.45
-
-# Precompute broadband spectrum
 one_third_freqs, spl_1_3 = compute_rotor_broadband_spectrum(rpm, thrust_n, cl_bar)
 
-# ------------------ Audio Callback ------------------
+# ------------------ Audio callback ------------------
 def audio_callback(outdata, frames, time_info, status):
     global oaspl, spl_spectrum
     if status:
         print(status)
     pressure = synthesize_broadband_block(one_third_freqs, spl_1_3, fs, frames)
-    # compute SPL for this block
     oaspl = compute_spl_db(pressure)
 
-    # FFT spectrum for display
+    # FFT SPL
     spectrum = np.abs(rfft(pressure)) / frames
     psd = (spectrum ** 2) * 2 / (fs / frames)
     spl_spectrum = 10 * np.log10(psd / (p0 ** 2) + 1e-30)
 
-    # store latest data for plotting
     with lock:
         wave_buffer.extend(pressure)
 
-    # stereo output
     outdata[:] = np.column_stack((pressure, pressure))
 
 
-# ------------------ Plotting Thread ------------------
-def start_plotting():
+# ------------------ Streaming thread ------------------
+def run_audio_stream():
+    with sd.OutputStream(
+        channels=channels,
+        samplerate=fs,
+        blocksize=blocksize,
+        callback=audio_callback,
+    ):
+        while True:
+            time.sleep(0.1)
+
+
+# ------------------ Main plotting (runs in main thread) ------------------
+def main():
+    print("Starting broadband noise streaming + live plotting...")
+
+    # Start audio stream in background
+    threading.Thread(target=run_audio_stream, daemon=True).start()
+
+    # ---- Matplotlib setup ----
     fig, axs = plt.subplots(3, 1, figsize=(10, 8))
     fig.subplots_adjust(hspace=0.4)
+
     axs[0].set_title("Broadband Pressure Time Series")
     axs[1].set_title("SPL Spectrum (FFT)")
     axs[2].set_title("1/3-Octave Spectrum")
 
     line_wave, = axs[0].plot([], [], lw=0.7, color='tab:blue')
     line_fft, = axs[1].semilogx([], [], lw=1.0, color='tab:blue')
-    bars = axs[2].bar(one_third_freqs, spl_1_3, width=np.array(one_third_freqs)*0.25, color='tab:orange', alpha=0.8)
+    bars = axs[2].bar(one_third_freqs, spl_1_3, width=np.array(one_third_freqs)*0.25,
+                      color='tab:orange', alpha=0.8)
 
     axs[0].set_xlim(0, duration)
-    axs[0].set_ylim(-0.2, 0.2)
     axs[0].set_xlabel("Time [s]")
     axs[0].set_ylabel("Pressure [Pa]")
     axs[0].grid(True)
 
     axs[1].set_xlim(20, fs/2)
-    axs[1].set_ylim(40, 140)
     axs[1].set_xlabel("Frequency [Hz]")
     axs[1].set_ylabel("SPL [dB re 20µPa]")
     axs[1].grid(True, which='both', ls='--', alpha=0.6)
 
     axs[2].set_xscale('log')
     axs[2].set_xlim(50, 10000)
-    axs[2].set_ylim(40, 140)
     axs[2].set_xlabel("Center Frequency [Hz]")
     axs[2].set_ylabel("SPL [dB re 20µPa]")
     axs[2].grid(True, which='both', ls='--', alpha=0.6)
@@ -147,31 +157,19 @@ def start_plotting():
         with lock:
             wave = np.array(wave_buffer)
             spl_fft = spl_spectrum.copy()
+            oaspl_val = oaspl
         if len(wave) > 0:
             t_wave = np.linspace(0, duration, len(wave))
             line_wave.set_data(t_wave, wave)
             axs[0].set_ylim(wave.min()*1.2, wave.max()*1.2)
         line_fft.set_data(freqs, spl_fft)
-        axs[1].set_ylim(min(spl_fft)-5, max(spl_fft)+5)
-        axs[2].set_title(f"1/3-Octave Spectrum (OASPL = {oaspl:.1f} dB)")
+        axs[1].set_ylim(np.nanmin(spl_fft)-5, np.nanmax(spl_fft)+5)
+        axs[2].set_title(f"1/3-Octave Spectrum (OASPL = {oaspl_val:.1f} dB)")
         return [line_wave, line_fft] + list(bars)
 
     ani = FuncAnimation(fig, update, interval=200, blit=False)
     plt.show()
 
-
-# ------------------ Main ------------------
-def main():
-    print("Starting broadband noise streaming + plotting...")
-    threading.Thread(target=start_plotting, daemon=True).start()
-    with sd.OutputStream(
-        channels=channels,
-        samplerate=fs,
-        blocksize=blocksize,
-        callback=audio_callback,
-    ):
-        while plt.get_fignums():
-            time.sleep(0.1)
 
 if __name__ == "__main__":
     main()
