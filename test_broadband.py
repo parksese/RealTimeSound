@@ -1,11 +1,24 @@
 # ============================================================
-#  Standalone Broadband Noise Test + Plot (ready for merge)
+#  Real-time Broadband Noise Streaming + Live Plot
 # ============================================================
 
 import numpy as np
+import sounddevice as sd
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 from scipy.signal import butter, sosfilt
 from scipy.fft import rfft, rfftfreq
+import threading
+import time
+from collections import deque
+
+# ------------------ Constants ------------------
+p0 = 20e-6
+fs = 22050
+blocksize = 4096
+channels = 2
+duration = 2.0        # seconds for time window in plot
+N_window = int(fs * duration)
 
 # ------------------ Helper functions ------------------
 def get_one_third_octave_bands():
@@ -17,31 +30,6 @@ def get_one_third_octave_bands():
     lower = center / (2 ** (1/6))
     upper = center * (2 ** (1/6))
     return np.vstack((lower, center, upper)).T
-
-
-def synthesize_broadband_block(one_third_freqs, spl_one_third, fs, n_samples, seed=None):
-    rng = np.random.default_rng(seed)
-    p0 = 20e-6
-    t = np.arange(n_samples) / fs
-    pressure = np.zeros_like(t, dtype=np.float32)
-
-    for fc, spl in zip(one_third_freqs, spl_one_third):
-        f_low = fc / np.sqrt(2)
-        f_high = fc * np.sqrt(2)
-        if f_high >= fs / 2:
-            continue
-
-        white = rng.standard_normal(len(t)).astype(np.float32)
-        sos = butter(4, [f_low, f_high], btype="bandpass", fs=fs, output="sos")
-        band_noise = sosfilt(sos, white)
-
-        # Scale RMS
-        p_rms_target = p0 * 10 ** (spl / 20.0)
-        p_rms_current = np.sqrt(np.mean(band_noise ** 2)) + 1e-12
-        band_noise *= (p_rms_target / p_rms_current)
-        pressure += band_noise
-
-    return t, pressure
 
 
 def compute_rotor_broadband_spectrum(rpm, thrust_n, cl_bar):
@@ -63,60 +51,127 @@ def compute_rotor_broadband_spectrum(rpm, thrust_n, cl_bar):
     return np.array(one_third_freqs), np.array(spl_one_third)
 
 
-def compute_spl_db(pressure_signal, pref=20e-6):
-    p_rms = np.sqrt(np.mean(pressure_signal ** 2))
-    return 20 * np.log10(p_rms / pref + 1e-20)
+def synthesize_broadband_block(one_third_freqs, spl_one_third, fs, n_samples, seed=None):
+    rng = np.random.default_rng(seed)
+    pressure = np.zeros(n_samples, dtype=np.float32)
+    for fc, spl in zip(one_third_freqs, spl_one_third):
+        f_low = fc / np.sqrt(2)
+        f_high = fc * np.sqrt(2)
+        if f_high >= fs/2:
+            continue
+        white = rng.standard_normal(n_samples).astype(np.float32)
+        sos = butter(4, [f_low, f_high], btype="bandpass", fs=fs, output="sos")
+        band_noise = sosfilt(sos, white)
+        p_rms_target = p0 * 10 ** (spl / 20.0)
+        p_rms_current = np.sqrt(np.mean(band_noise**2)) + 1e-12
+        band_noise *= (p_rms_target / p_rms_current)
+        pressure += band_noise
+    return pressure
 
 
-# ------------------ Test + Plot ------------------
-if __name__ == "__main__":
-    fs = 22050
-    duration = 2.0
-    n_samples = int(fs * duration)
+def compute_spl_db(p):
+    return 20 * np.log10(np.sqrt(np.mean(p**2)) / p0 + 1e-20)
 
-    # Example parameters
-    rpm = 470
-    thrust_n = 1500.0
-    cl_bar = 0.45
 
-    # Compute 1/3-octave spectrum and synthesize pressure
-    one_third_freqs, spl_one_third = compute_rotor_broadband_spectrum(rpm, thrust_n, cl_bar)
-    t, pressure = synthesize_broadband_block(one_third_freqs, spl_one_third, fs, n_samples)
+# ------------------ Live Data Buffers ------------------
+wave_buffer = deque(maxlen=N_window)
+freqs = rfftfreq(blocksize, 1/fs)
+spl_spectrum = np.zeros_like(freqs)
+spl_1_3 = None
+one_third_freqs = None
+oaspl = 0.0
+lock = threading.Lock()
 
-    # Compute FFT and OASPL
-    freqs = rfftfreq(n_samples, 1/fs)
-    spectrum = np.abs(rfft(pressure))
+# ------------------ Parameters ------------------
+rpm = 470
+thrust_n = 1500.0
+cl_bar = 0.45
+
+# Precompute broadband spectrum
+one_third_freqs, spl_1_3 = compute_rotor_broadband_spectrum(rpm, thrust_n, cl_bar)
+
+# ------------------ Audio Callback ------------------
+def audio_callback(outdata, frames, time_info, status):
+    global oaspl, spl_spectrum
+    if status:
+        print(status)
+    pressure = synthesize_broadband_block(one_third_freqs, spl_1_3, fs, frames)
+    # compute SPL for this block
     oaspl = compute_spl_db(pressure)
-    print(f"Overall SPL (OASPL): {oaspl:.2f} dB re 20µPa")
 
-    # Plot
+    # FFT spectrum for display
+    spectrum = np.abs(rfft(pressure)) / frames
+    psd = (spectrum ** 2) * 2 / (fs / frames)
+    spl_spectrum = 10 * np.log10(psd / (p0 ** 2) + 1e-30)
+
+    # store latest data for plotting
+    with lock:
+        wave_buffer.extend(pressure)
+
+    # stereo output
+    outdata[:] = np.column_stack((pressure, pressure))
+
+
+# ------------------ Plotting Thread ------------------
+def start_plotting():
     fig, axs = plt.subplots(3, 1, figsize=(10, 8))
     fig.subplots_adjust(hspace=0.4)
-
-    # --- Time domain ---
-    axs[0].plot(t, pressure, lw=0.7)
     axs[0].set_title("Broadband Pressure Time Series")
+    axs[1].set_title("SPL Spectrum (FFT)")
+    axs[2].set_title("1/3-Octave Spectrum")
+
+    line_wave, = axs[0].plot([], [], lw=0.7, color='tab:blue')
+    line_fft, = axs[1].semilogx([], [], lw=1.0, color='tab:blue')
+    bars = axs[2].bar(one_third_freqs, spl_1_3, width=np.array(one_third_freqs)*0.25, color='tab:orange', alpha=0.8)
+
+    axs[0].set_xlim(0, duration)
+    axs[0].set_ylim(-0.2, 0.2)
     axs[0].set_xlabel("Time [s]")
     axs[0].set_ylabel("Pressure [Pa]")
     axs[0].grid(True)
 
-    # --- Frequency domain ---
-    axs[1].semilogx(freqs, 20*np.log10(spectrum/np.max(spectrum) + 1e-12))
     axs[1].set_xlim(20, fs/2)
-    axs[1].set_ylim(-60, 0)
-    axs[1].set_title("Normalized Spectrum")
+    axs[1].set_ylim(40, 140)
     axs[1].set_xlabel("Frequency [Hz]")
-    axs[1].set_ylabel("Level [dB]")
-    axs[1].grid(True, which="both", ls="--", alpha=0.6)
+    axs[1].set_ylabel("SPL [dB re 20µPa]")
+    axs[1].grid(True, which='both', ls='--', alpha=0.6)
 
-    # --- SPL bar chart per band ---
-    axs[2].bar(one_third_freqs, spl_one_third, width=np.array(one_third_freqs)*0.2, align='center')
     axs[2].set_xscale('log')
     axs[2].set_xlim(50, 10000)
-    axs[2].set_ylim(min(spl_one_third)-5, max(spl_one_third)+5)
-    axs[2].set_title(f"1/3-Octave Spectrum (OASPL = {oaspl:.1f} dB)")
+    axs[2].set_ylim(40, 140)
     axs[2].set_xlabel("Center Frequency [Hz]")
-    axs[2].set_ylabel("SPL [dB]")
-    axs[2].grid(True, which="both", ls="--", alpha=0.6)
+    axs[2].set_ylabel("SPL [dB re 20µPa]")
+    axs[2].grid(True, which='both', ls='--', alpha=0.6)
 
+    def update(frame):
+        with lock:
+            wave = np.array(wave_buffer)
+            spl_fft = spl_spectrum.copy()
+        if len(wave) > 0:
+            t_wave = np.linspace(0, duration, len(wave))
+            line_wave.set_data(t_wave, wave)
+            axs[0].set_ylim(wave.min()*1.2, wave.max()*1.2)
+        line_fft.set_data(freqs, spl_fft)
+        axs[1].set_ylim(min(spl_fft)-5, max(spl_fft)+5)
+        axs[2].set_title(f"1/3-Octave Spectrum (OASPL = {oaspl:.1f} dB)")
+        return [line_wave, line_fft] + list(bars)
+
+    ani = FuncAnimation(fig, update, interval=200, blit=False)
     plt.show()
+
+
+# ------------------ Main ------------------
+def main():
+    print("Starting broadband noise streaming + plotting...")
+    threading.Thread(target=start_plotting, daemon=True).start()
+    with sd.OutputStream(
+        channels=channels,
+        samplerate=fs,
+        blocksize=blocksize,
+        callback=audio_callback,
+    ):
+        while plt.get_fignums():
+            time.sleep(0.1)
+
+if __name__ == "__main__":
+    main()
