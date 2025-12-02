@@ -273,3 +273,158 @@ if __name__ == "__main__":
     plt.legend()
     plt.grid(True)
     plt.show()
+    
+    
+    
+    
+    
+    
+    
+    
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# =========================
+# Constants
+# =========================
+SPEED_OF_SOUND = 340.0
+ROTOR_RADIUS   = 3.0
+T_HIST         = 1.0
+
+# ============================================
+# Azimuth history class
+# ============================================
+class AzimuthHistory:
+    def __init__(self):
+        self.times = []
+        self.omega = []
+        self.az    = []
+        self.az_current = 0.0
+
+    def update(self, t_sim, omega):
+        if self.times:
+            dt = t_sim - self.times[-1]
+            self.az_current += self.omega[-1] * dt
+
+        self.times.append(float(t_sim))
+        self.omega.append(float(omega))
+        self.az.append(float(self.az_current))
+
+        # trim history
+        cutoff = t_sim - T_HIST
+        while len(self.times) > 2 and self.times[0] < cutoff:
+            self.times.pop(0)
+            self.omega.pop(0)
+            self.az.pop(0)
+
+    def azimuth_at(self, t_query):
+        i = np.searchsorted(self.times, t_query) - 1
+        if i < 0: i = 0
+        if i >= len(self.times)-1: i = len(self.times)-2
+
+        t0, t1 = self.times[i], self.times[i+1]
+        a0, a1 = self.az[i], self.az[i+1]
+        w0, w1 = self.omega[i], self.omega[i+1]
+
+        if t1 == t0:
+            return a0
+
+        alpha = (t_query - t0)/(t1 - t0)
+        omega_r = w0 + alpha*(w1 - w0)
+
+        return a0 + omega_r*(t_query - t0)
+
+
+# ============================================
+# Blade position
+# ============================================
+def blade_position(azimuth):
+    x = ROTOR_RADIUS * np.cos(azimuth)
+    y = ROTOR_RADIUS * np.sin(azimuth)
+    return np.array([x, y, 0.0])
+
+
+# ============================================
+# Retarded-time solver
+# ============================================
+def retarded_time(t_obs, observer_pos, az_hist):
+    # initial guess
+    az_now = az_hist.azimuth_at(t_obs)
+    pos_now = blade_position(az_now)
+    R0 = np.linalg.norm(observer_pos - pos_now)
+    t_r = t_obs - R0/SPEED_OF_SOUND
+
+    # one refinement
+    az_r = az_hist.azimuth_at(t_r)
+    pos_r = blade_position(az_r)
+    R = np.linalg.norm(observer_pos - pos_r)
+    t_r = t_obs - R/SPEED_OF_SOUND
+
+    return t_r
+
+
+# ============================================
+# MAIN
+# ============================================
+if __name__ == "__main__":
+
+    observer_pos = np.array([10.0, 0.0, 0.0])
+
+    az_hist = AzimuthHistory()
+
+    # ---- build source-time history ----
+    t = 0.0
+    dt = 0.002
+    T_total = 1.0
+
+    while t < T_total:
+        rpm = 300 + 60*t
+        omega = rpm * 2*np.pi/60
+        az_hist.update(t, omega)
+        t += dt
+
+    # ============================================
+    # A) SOURCE-TIME-BASED PREDICTION
+    # ============================================
+    src_t = np.array(az_hist.times)
+    src_az = np.array(az_hist.az)
+
+    src_obs_times = []
+    for ts, azs in zip(src_t, src_az):
+        pos = blade_position(azs)
+        R = np.linalg.norm(observer_pos - pos)
+        tobs = ts + R/SPEED_OF_SOUND
+        src_obs_times.append(tobs)
+
+    src_obs_times = np.array(src_obs_times)
+
+    # ============================================
+    # B) OBSERVER-TIME-BASED PREDICTION
+    # ============================================
+    obs_times = np.linspace(0.5, 1.0, 300)
+    obs_ret_az = []
+
+    for t_obs in obs_times:
+        t_r = retarded_time(t_obs, observer_pos, az_hist)
+        obs_ret_az.append(az_hist.azimuth_at(t_r))
+
+    obs_ret_az = np.array(obs_ret_az)
+
+    # ============================================
+    # PLOT FAIR COMPARISON
+    # ============================================
+    plt.figure(figsize=(10,6))
+
+    # Source-time based: observer arrival time vs azimuth(ts)
+    plt.plot(src_obs_times, src_az, label="Source-time-based (t_o = t_s + R/c)")
+
+    # Observer-time based: azimuth at retarded time t_r
+    plt.plot(obs_times, obs_ret_az, label="Observer-time-based (azimuth(t_r))", linewidth=3)
+
+    plt.xlabel("Observer time t_o [s]")
+    plt.ylabel("Blade azimuth [rad]")
+    plt.title("FAIR Comparison: Source-time vs Observer-time Retarded Azimuth")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
