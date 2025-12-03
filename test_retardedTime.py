@@ -531,4 +531,291 @@ if __name__ == "__main__":
     plt.grid(True)
 
     plt.show()
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+import numpy as np
+import time
+import matplotlib.pyplot as plt
+
+# =========================
+# GLOBAL CONSTANTS
+# =========================
+SPEED_OF_SOUND = 340.0
+ROTOR_RADIUS   = 3.0
+RHO            = 1.225
+
+# Simulation / geometry
+N_ROTORS = 4
+N_BLADES = 5
+N_SOURCES = N_ROTORS * N_BLADES
+
+T_TOTAL = 0.5
+DT_SIM  = 0.0005
+
+# =========================
+# AZIMUTH HISTORY CLASS
+# =========================
+class AzimuthHistory:
+    def __init__(self):
+        self.times = []
+        self.az    = []
+        self.omega = []
+        self.az_current = 0.0
+
+    def update(self, t_sim, omega_now):
+        if self.times:
+            dt = t_sim - self.times[-1]
+            self.az_current += self.omega[-1] * dt
+
+        self.times.append(float(t_sim))
+        self.az.append(float(self.az_current))
+        self.omega.append(float(omega_now))
+
+    def azimuth_and_omega_at(self, t_query):
+        times = self.times
+        if len(times) < 2:
+            return self.az[-1], self.omega[-1]
+
+        i = np.searchsorted(times, t_query) - 1
+        if i < 0: 
+            i = 0
+        if i >= len(times) - 1:
+            i = len(times) - 2
+
+        t0, t1 = times[i], times[i+1]
+        az0, az1 = self.az[i], self.az[i+1]
+        w0,  w1  = self.omega[i], self.omega[i+1]
+
+        if t1 == t0:
+            return az0, w0
+
+        alpha = (t_query - t0)/(t1 - t0)
+        az_interp = az0 + alpha*(az1-az0)
+        w_interp  = w0  + alpha*(w1-w0)
+
+        return az_interp, w_interp
+
+
+# =========================
+# GEOMETRY
+# =========================
+def blade_kinematics(psi, omega, rotor_center, R=ROTOR_RADIUS):
+    x_rel = R*np.cos(psi)
+    y_rel = R*np.sin(psi)
+    pos = rotor_center + np.array([x_rel, y_rel, 0])
+
+    vx = -omega * R * np.sin(psi)
+    vy =  omega * R * np.cos(psi)
+    vel = np.array([vx, vy, 0])
+    return pos, vel
+
+
+# =========================
+# LAWSON-STYLE PRESSURE
+# =========================
+def lawson_pressure(obs, pos, vel, psi, omega, L0=1.0):
+    r = obs - pos
+    R = np.linalg.norm(r)
+    if R < 1e-9:
+        return 0.0, 1e-9
+
+    n = r / R
+    n_dot_eL = n[2]
+
+    n_dot_v = np.dot(n, vel)
+    M_r = n_dot_v / SPEED_OF_SOUND
+
+    d_nF_dt = -L0 * np.sin(psi) * omega * n_dot_eL
+
+    denom = (1.0 - M_r)**2 + 1e-6
+
+    p = (1/(4*np.pi*SPEED_OF_SOUND*R)) * (d_nF_dt / denom)
+
+    return p, R
+
+
+# =========================
+# RETARDED TIME SOLVER
+# =========================
+def retarded_time_for_source(t_obs, obs, hist, rotor_center, blade_phase):
+    t_r = t_obs
+    for _ in range(3):
+        az_r, _ = hist.azimuth_and_omega_at(t_r)
+        psi_r = az_r + blade_phase
+        posr, _ = blade_kinematics(psi_r, 0.0, rotor_center)
+        R = np.linalg.norm(obs - posr)
+        t_r = t_obs - R/SPEED_OF_SOUND
+    return t_r
+
+
+# =========================
+# MAIN BENCHMARK
+# =========================
+if __name__ == "__main__":
+
+    # 1) Build rotor histories
+    rot_hist = [AzimuthHistory() for _ in range(N_ROTORS)]
+
+    t = 0.0
+    while t < T_TOTAL:
+        rpm = 300.0
+        omega = rpm * 2*np.pi/60
+        for r in range(N_ROTORS):
+            rot_hist[r].update(t, omega)
+        t += DT_SIM
+
+    # 2) Build geometry
+    rotor_centers = [
+        np.array([ 5,  5, 0]),
+        np.array([-5,  5, 0]),
+        np.array([-5, -5, 0]),
+        np.array([ 5, -5, 0]),
+    ]
+
+    source_info = []  # (rotor_id, blade_phase, center)
+    for r in range(N_ROTORS):
+        center = rotor_centers[r]
+        for b in range(N_BLADES):
+            blade_phase = 2*np.pi*b/N_BLADES
+            source_info.append((r, blade_phase, center))
+
+    observer_pos = np.array([0.0, 0.0, 0.0])
+
+    # =====================================================
+    # 3) SOURCE-TIME–BASED (pressure + azimuth)
+    # =====================================================
+    t_s_array = np.arange(0, T_TOTAL, DT_SIM)
+
+    per_source_t_obs = []
+    per_source_p     = []
+    per_source_psi   = []
+
+    for (r, blade_phase, center) in source_info:
+        hist = rot_hist[r]
+
+        t_obs_list = []
+        p_list     = []
+        psi_list   = []
+
+        for ts in t_s_array:
+            az, omega = hist.azimuth_and_omega_at(ts)
+            psi = az + blade_phase
+            pos, vel = blade_kinematics(psi, omega, center)
+            p, R = lawson_pressure(observer_pos, pos, vel, psi, omega, L0=1.0)
+
+            t_obs = ts + R/SPEED_OF_SOUND
+
+            t_obs_list.append(t_obs)
+            p_list.append(p)
+            psi_list.append(psi)
+
+        # sort by observer time
+        t_obs_array = np.array(t_obs_list)
+        sort_idx = np.argsort(t_obs_array)
+        t_obs_sorted = t_obs_array[sort_idx]
+        p_sorted     = np.array(p_list)[sort_idx]
+        psi_sorted   = np.array(psi_list)[sort_idx]
+
+        per_source_t_obs.append(t_obs_sorted)
+        per_source_p.append(p_sorted)
+        per_source_psi.append(psi_sorted)
+
+
+    # observer-time window intersection
+    start_times = [arr[0] for arr in per_source_t_obs]
+    end_times   = [arr[-1] for arr in per_source_t_obs]
+    t_obs_min = max(start_times)
+    t_obs_max = min(end_times)
+
+    t_obs_uniform = np.linspace(t_obs_min, t_obs_max, 4096)
+
+
+    # interpolate to uniform observer time
+    p_src_uniform  = np.zeros_like(t_obs_uniform)
+    psi_src_uniform = np.zeros_like(t_obs_uniform)
+
+    for s in range(N_SOURCES):
+        p_src_uniform  += np.interp(t_obs_uniform,
+                                    per_source_t_obs[s],
+                                    per_source_p[s])
+
+        psi_src_uniform += np.interp(t_obs_uniform,
+                                     per_source_t_obs[s],
+                                     per_source_psi[s])
+
+
+    # =====================================================
+    # 4) OBSERVER-TIME–BASED (pressure + azimuth)
+    # =====================================================
+    p_obs_uniform  = np.zeros_like(t_obs_uniform)
+    psi_obs_uniform = np.zeros_like(t_obs_uniform)
+
+    for i, t_obs in enumerate(t_obs_uniform):
+        p_sum = 0.0
+        psi_sum = 0.0
+        for (r, blade_phase, center) in source_info:
+
+            hist = rot_hist[r]
+
+            # retarded time
+            t_r = retarded_time_for_source(t_obs, observer_pos,
+                                           hist, center, blade_phase)
+
+            az_r, omega_r = hist.azimuth_and_omega_at(t_r)
+            psi_r = az_r + blade_phase
+            pos_r, vel_r = blade_kinematics(psi_r, omega_r, center)
+            p_r, _ = lawson_pressure(observer_pos, pos_r, vel_r, psi_r, omega_r, L0=1.0)
+
+            p_sum += p_r
+            psi_sum += psi_r   # pure sum for consistency
+
+        p_obs_uniform[i]  = p_sum
+        psi_obs_uniform[i] = psi_sum
+
+
+    # Convert azimuths to degrees
+    psi_src_deg = np.rad2deg(psi_src_uniform)
+    psi_obs_deg = np.rad2deg(psi_obs_uniform)
+
+    # Difference
+    psi_diff = psi_src_deg - psi_obs_deg
+    rms_psi = np.sqrt(np.mean(psi_diff**2))
+
+    print("\n==== AZIMUTH COMPARISON ====")
+    print(f"RMS azimuth difference [deg] : {rms_psi:.3f}")
+    print(f"Max difference [deg]        : {np.max(np.abs(psi_diff)):.3f}\n")
+
+    # ============================
+    # 5) PLOT RESULTS
+    # ============================
+    plt.figure(figsize=(10,6))
+    plt.plot(t_obs_uniform, psi_src_deg, label="Source-time (interp)", alpha=0.7)
+    plt.plot(t_obs_uniform, psi_obs_deg, '--', label="Observer-time (retarded)", linewidth=2)
+    plt.xlabel("Observer time [s]")
+    plt.ylabel("Azimuth [deg]")
+    plt.title("Azimuth Comparison: Source-Time vs Observer-Time")
+    plt.legend()
+    plt.grid(True)
+
+    plt.figure(figsize=(10,4))
+    plt.plot(t_obs_uniform, psi_diff)
+    plt.xlabel("Observer time [s]")
+    plt.ylabel("Azimuth difference [deg]")
+    plt.title("Azimuth Difference")
+    plt.grid(True)
+
+    plt.show()
 
