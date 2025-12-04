@@ -1275,5 +1275,451 @@ if __name__ == "__main__":
     plt.grid(True)
 
     plt.show()
+    
+    
+---------
+A-opt2
+----------
+
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+from numba import njit
+
+# =========================
+# Constants & config
+# =========================
+SPEED_OF_SOUND = 340.0
+ROTOR_RADIUS   = 3.0
+DT_SIM         = 0.0005
+T_TOTAL        = 0.5
+
+N_ROTORS = 4
+N_BLADES = 5
+N_SPAN   = 6   # spanwise discretization per blade
+
+SPAN_RADII = np.linspace(0.3 * ROTOR_RADIUS, ROTOR_RADIUS, N_SPAN)
+N_ELEMENTS = N_ROTORS * N_BLADES * N_SPAN
+
+
+# =========================
+# Azimuth history per rotor (Python side)
+# =========================
+class AzimuthHistory:
+    def __init__(self):
+        self.times_list = []
+        self.az_list    = []
+        self.omega_list = []
+        self.az_current = 0.0
+
+    def update(self, t, omega):
+        if self.times_list:
+            dt = t - self.times_list[-1]
+            self.az_current += self.omega_list[-1] * dt
+        self.times_list.append(float(t))
+        self.az_list.append(float(self.az_current))
+        self.omega_list.append(float(omega))
+
+    def finalize(self):
+        self.times = np.array(self.times_list, dtype=np.float64)
+        self.az    = np.array(self.az_list, dtype=np.float64)
+        self.omega = np.array(self.omega_list, dtype=np.float64)
+        if len(self.times) >= 2:
+            self.dt = self.times[1] - self.times[0]
+        else:
+            self.dt = DT_SIM
+
+
+# =========================
+# Source-time Lowson (vectorized helper, used in source-time path)
+# =========================
+def lowson_pressure_array(obs_pos, src_pos, psi, omega, radius, L0=1.0):
+    """
+    Vectorized Lowson near-field dipole for many elements at once.
+    obs_pos : (3,)
+    src_pos : (N,3)
+    psi     : (N,)
+    omega   : (N,)
+    radius  : (N,)
+    Returns:
+        p_near : (N,)
+        rmag   : (N,)
+    """
+    r = obs_pos - src_pos
+    rmag = np.linalg.norm(r, axis=1)
+    rmag_safe = rmag + 1e-12
+    rhat = r / rmag_safe[:, None]
+
+    M = omega * radius / SPEED_OF_SOUND
+
+    Mi = np.empty_like(src_pos)
+    Mi[:, 0] = -M * np.sin(psi)
+    Mi[:, 1] =  M * np.cos(psi)
+    Mi[:, 2] =  0.0
+
+    # vertical dipole Fi = (0,0,L0)
+    Fr = rhat[:, 2] * L0
+    Mr = np.einsum("ij,ij->i", rhat, Mi)
+
+    num   = Fr * (1 - M**2) / (1 - Mr + 1e-12)
+    denom = (1 - Mr + 1e-12)**2 * (rmag_safe**2)
+
+    p_near = (0.25/np.pi) * (num / denom)
+    return p_near, rmag
+
+
+# =========================
+# Numba-accelerated observer-time kernel
+# =========================
+@njit
+def observer_time_kernel(
+    t_obs_uniform,          # (N_obs,)
+    times,                  # (N_hist,)
+    az_hist,                # (N_rotors, N_hist)
+    omega_hist,             # (N_rotors, N_hist)
+    dt_hist,                # scalar
+    elem_rotor_id,          # (N_elements,)
+    elem_psi0,              # (N_elements,)
+    elem_center,            # (N_elements, 3)
+    elem_radius,            # (N_elements,)
+    observer                # (3,)
+):
+    N_obs = t_obs_uniform.shape[0]
+    N_hist = times.shape[0]
+    N_elements = elem_rotor_id.shape[0]
+
+    p_obs = np.zeros(N_obs, dtype=np.float64)
+
+    t0 = times[0]
+    eps = 1e-12
+
+    for i in range(N_obs):
+        t_obs = t_obs_uniform[i]
+
+        # initial guess t_r = t_obs for all elements
+        t_r = np.full(N_elements, t_obs, dtype=np.float64)
+
+        # fixed-point iteration for retarded time
+        for _ in range(3):
+            # we will compute az, omega, psi, pos for all elements
+            for e in range(N_elements):
+                r_id = elem_rotor_id[e]
+
+                # interpolate az, omega at t_r[e]
+                idx_float = (t_r[e] - t0) / dt_hist
+
+                if idx_float <= 0.0:
+                    az = az_hist[r_id, 0]
+                    w  = omega_hist[r_id, 0]
+                elif idx_float >= N_hist - 1:
+                    az = az_hist[r_id, N_hist-1]
+                    w  = omega_hist[r_id, N_hist-1]
+                else:
+                    i0 = int(idx_float)
+                    alpha = idx_float - i0
+                    i1 = i0 + 1
+                    az0 = az_hist[r_id, i0]
+                    az1 = az_hist[r_id, i1]
+                    w0  = omega_hist[r_id, i0]
+                    w1  = omega_hist[r_id, i1]
+                    az = az0 + alpha*(az1 - az0)
+                    w  = w0  + alpha*(w1  - w0)
+
+                psi0 = elem_psi0[e]
+                psi  = az + psi0
+                radius = elem_radius[e]
+
+                # position at radius, psi
+                x = radius * np.cos(psi)
+                y = radius * np.sin(psi)
+
+                src_x = elem_center[e, 0] + x
+                src_y = elem_center[e, 1] + y
+                src_z = elem_center[e, 2]
+
+                dx = observer[0] - src_x
+                dy = observer[1] - src_y
+                dz = observer[2] - src_z
+
+                R = np.sqrt(dx*dx + dy*dy + dz*dz) + eps
+
+                # update retarded time
+                t_r[e] = t_obs - R / SPEED_OF_SOUND
+
+        # final pressure evaluation at converged t_r
+        p_sum = 0.0
+        for e in range(N_elements):
+            r_id = elem_rotor_id[e]
+
+            # interpolate az, omega again at final t_r
+            idx_float = (t_r[e] - t0) / dt_hist
+
+            if idx_float <= 0.0:
+                az = az_hist[r_id, 0]
+                w  = omega_hist[r_id, 0]
+            elif idx_float >= N_hist - 1:
+                az = az_hist[r_id, N_hist-1]
+                w  = omega_hist[r_id, N_hist-1]
+            else:
+                i0 = int(idx_float)
+                alpha = idx_float - i0
+                i1 = i0 + 1
+                az0 = az_hist[r_id, i0]
+                az1 = az_hist[r_id, i1]
+                w0  = omega_hist[r_id, i0]
+                w1  = omega_hist[r_id, i1]
+                az = az0 + alpha*(az1 - az0)
+                w  = w0  + alpha*(w1  - w0)
+
+            psi0 = elem_psi0[e]
+            psi  = az + psi0
+            radius = elem_radius[e]
+
+            # position
+            x = radius * np.cos(psi)
+            y = radius * np.sin(psi)
+
+            src_x = elem_center[e, 0] + x
+            src_y = elem_center[e, 1] + y
+            src_z = elem_center[e, 2]
+
+            dx = observer[0] - src_x
+            dy = observer[1] - src_y
+            dz = observer[2] - src_z
+
+            R = np.sqrt(dx*dx + dy*dy + dz*dz) + eps
+
+            # Lowson dipole (inline, L0=1)
+            rhat_x = dx / R
+            rhat_y = dy / R
+            rhat_z = dz / R
+
+            M = w * radius / SPEED_OF_SOUND
+
+            Mi_x = -M * np.sin(psi)
+            Mi_y =  M * np.cos(psi)
+            Mi_z =  0.0
+
+            Mr = rhat_x*Mi_x + rhat_y*Mi_y + rhat_z*Mi_z
+            Fr = rhat_z * 1.0    # Fi=(0,0,1)
+
+            num   = Fr * (1.0 - M*M) / (1.0 - Mr + eps)
+            denom = (1.0 - Mr + eps)**2 * (R*R)
+
+            p = (0.25/np.pi) * (num / denom)
+            p_sum += p
+
+        p_obs[i] = p_sum
+
+    return p_obs
+
+
+# =========================
+# MAIN: Source-time vs Numba observer-time
+# =========================
+if __name__ == "__main__":
+    # 1) Build rotor histories
+    rotor_hist = [AzimuthHistory() for _ in range(N_ROTORS)]
+
+    t = 0.0
+    while t < T_TOTAL:
+        rpm = 300.0
+        omega = rpm * 2.0 * np.pi / 60.0
+        for r in range(N_ROTORS):
+            rotor_hist[r].update(t, omega)
+        t += DT_SIM
+
+    for hist in rotor_hist:
+        hist.finalize()
+
+    # Build shared history arrays for Numba
+    times = rotor_hist[0].times.copy()
+    N_hist = len(times)
+    dt_hist = rotor_hist[0].dt
+
+    az_hist = np.zeros((N_ROTORS, N_hist), dtype=np.float64)
+    omega_hist = np.zeros((N_ROTORS, N_hist), dtype=np.float64)
+    for r in range(N_ROTORS):
+        az_hist[r, :]    = rotor_hist[r].az
+        omega_hist[r, :] = rotor_hist[r].omega
+
+    # 2) Geometry & element mapping
+    rotor_centers = np.array([
+        [ 5.0,  5.0, 0.0],
+        [-5.0,  5.0, 0.0],
+        [-5.0, -5.0, 0.0],
+        [ 5.0, -5.0, 0.0],
+    ], dtype=np.float64)
+
+    hub_phase = np.array([0.0, np.pi/2, np.pi, 3*np.pi/2], dtype=np.float64)
+
+    elem_rotor_id = np.zeros(N_ELEMENTS, dtype=np.int64)
+    elem_psi0     = np.zeros(N_ELEMENTS, dtype=np.float64)
+    elem_center   = np.zeros((N_ELEMENTS, 3), dtype=np.float64)
+    elem_radius   = np.zeros(N_ELEMENTS, dtype=np.float64)
+
+    idx = 0
+    for r in range(N_ROTORS):
+        center = rotor_centers[r]
+        for b in range(N_BLADES):
+            blade_phase = 2.0 * np.pi * b / N_BLADES
+            psi0 = hub_phase[r] + blade_phase
+            for s in range(N_SPAN):
+                elem_rotor_id[idx] = r
+                elem_psi0[idx]     = psi0
+                elem_center[idx]   = center
+                elem_radius[idx]   = SPAN_RADII[s]
+                idx += 1
+
+    observer = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+
+    # =========================
+    # SOURCE-TIME PATH (same as before)
+    # =========================
+    t_s = np.arange(0.0, T_TOTAL, DT_SIM)
+
+    per_elem_tobs = []
+    per_elem_p    = []
+
+    t0_src_build = time.perf_counter()
+
+    for e in range(N_ELEMENTS):
+        r_id   = elem_rotor_id[e]
+        psi0   = elem_psi0[e]
+        center = elem_center[e]
+        radius = elem_radius[e]
+
+        hist = rotor_hist[r_id]
+
+        t_obs_list = []
+        p_list     = []
+
+        for ts in t_s:
+            # scalar az, omega from history
+            # simple direct index instead of searchsorted
+            idx_f = (ts - hist.times[0]) / hist.dt
+            if idx_f <= 0.0:
+                az = hist.az[0]
+                w  = hist.omega[0]
+            elif idx_f >= N_hist - 1:
+                az = hist.az[-1]
+                w  = hist.omega[-1]
+            else:
+                i0 = int(idx_f)
+                a  = idx_f - i0
+                i1 = i0 + 1
+                az = hist.az[i0] + a*(hist.az[i1] - hist.az[i0])
+                w  = hist.omega[i0] + a*(hist.omega[i1] - hist.omega[i0])
+
+            psi = az + psi0
+
+            x = radius * np.cos(psi)
+            y = radius * np.sin(psi)
+            src_pos = center + np.array([x, y, 0.0])
+
+            p_arr, R_arr = lowson_pressure_array(
+                observer, src_pos[None, :],
+                np.array([psi]), np.array([w]),
+                np.array([radius])
+            )
+            p = p_arr[0]
+            R = R_arr[0]
+
+            t_obs = ts + R / SPEED_OF_SOUND
+            t_obs_list.append(t_obs)
+            p_list.append(p)
+
+        t_obs_arr = np.array(t_obs_list)
+        p_arr     = np.array(p_list)
+
+        if np.all(np.diff(t_obs_arr) >= 0):
+            per_elem_tobs.append(t_obs_arr)
+            per_elem_p.append(p_arr)
+        else:
+            sort_idx = np.argsort(t_obs_arr)
+            per_elem_tobs.append(t_obs_arr[sort_idx])
+            per_elem_p.append(p_arr[sort_idx])
+
+    t1_src_build = time.perf_counter()
+
+    starts = [arr[0] for arr in per_elem_tobs]
+    ends   = [arr[-1] for arr in per_elem_tobs]
+    tmin = max(starts)
+    tmax = min(ends)
+
+    N_OBS = 4096
+    t_obs_uniform = np.linspace(tmin, tmax, N_OBS)
+
+    p_src_uniform = np.zeros_like(t_obs_uniform)
+
+    t0_src_interp = time.perf_counter()
+
+    for e in range(N_ELEMENTS):
+        t_arr = np.asarray(per_elem_tobs[e]).ravel()
+        p_arr = np.asarray(per_elem_p[e]).ravel()
+        p_src_uniform += np.interp(t_obs_uniform, t_arr, p_arr)
+
+    t1_src_interp = time.perf_counter()
+
+    T_src_build  = t1_src_build  - t0_src_build
+    T_src_interp = t1_src_interp - t0_src_interp
+    T_src_total  = T_src_build + T_src_interp
+
+    # =========================
+    # OBSERVER-TIME PATH (Numba)
+    # =========================
+    # First call includes JIT compile time
+    t0_obs_total = time.perf_counter()
+
+    p_obs_uniform = observer_time_kernel(
+        t_obs_uniform,
+        times,
+        az_hist,
+        omega_hist,
+        dt_hist,
+        elem_rotor_id,
+        elem_psi0,
+        elem_center,
+        elem_radius,
+        observer
+    )
+
+    t1_obs_total = time.perf_counter()
+    T_obs_total  = t1_obs_total - t0_obs_total
+
+    # =========================
+    # Compare signals
+    # =========================
+    diff = p_src_uniform - p_obs_uniform
+    rms_diff = np.sqrt(np.mean(diff**2))
+    rel_rms = rms_diff / (np.sqrt(np.mean(p_src_uniform**2)) + 1e-12)
+
+    print("\n==== TIMING with 6 span stations (A-opt2, Numba) ====")
+    print(f"Source-time: build   : {T_src_build:.6f} s")
+    print(f"Source-time: interp  : {T_src_interp:.6f} s")
+    print(f"Source-time: TOTAL   : {T_src_total:.6f} s")
+    print(f"Observer-time (Numba): TOTAL : {T_obs_total:.6f} s")
+    print("\n==== NUMERICAL DIFFERENCE ====")
+    print(f"RMS diff (Pa, rel)   : {rms_diff:.3e}  (rel = {rel_rms:.3e})")
+
+    plt.figure(figsize=(10,6))
+    plt.plot(t_obs_uniform, p_src_uniform, label="Source-time (interp)")
+    plt.plot(t_obs_uniform, p_obs_uniform, '--', label="Observer-time (Numba)")
+    plt.xlabel("Observer time [s]")
+    plt.ylabel("Pressure (relative)")
+    plt.title("Total Pressure Comparison (A-opt2, 6 spanwise elements)")
+    plt.legend()
+    plt.grid(True)
+
+    plt.figure(figsize=(10,4))
+    plt.plot(t_obs_uniform, diff)
+    plt.xlabel("Observer time [s]")
+    plt.ylabel("p_src - p_obs")
+    plt.title("Pressure Difference")
+    plt.grid(True)
+
+    plt.show()
+
+
 
 
