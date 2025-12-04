@@ -1,5 +1,290 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import time
+
+# =========================
+# Constants & config
+# =========================
+SPEED_OF_SOUND = 340.0
+ROTOR_RADIUS   = 3.0
+DT_SIM         = 0.0005
+T_TOTAL        = 0.5
+
+N_ROTORS = 4
+N_BLADES = 5
+N_SOURCES = N_ROTORS * N_BLADES
+
+# =========================
+# Azimuth history per rotor
+# =========================
+class AzimuthHistory:
+    def __init__(self):
+        self.times = []
+        self.az    = []
+        self.omega = []
+        self.az_current = 0.0
+
+    def update(self, t, omega):
+        if self.times:
+            dt = t - self.times[-1]
+            self.az_current += self.omega[-1] * dt
+        self.times.append(float(t))
+        self.az.append(float(self.az_current))
+        self.omega.append(float(omega))
+
+    def at(self, t_query):
+        """Return (az, omega) at arbitrary time by linear interpolation."""
+        times = self.times
+        if len(times) < 2:
+            return self.az[-1], self.omega[-1]
+
+        i = np.searchsorted(times, t_query) - 1
+        i = max(0, min(i, len(times)-2))
+
+        t0, t1 = times[i], times[i+1]
+        az0, az1 = self.az[i], self.az[i+1]
+        w0,  w1  = self.omega[i], self.omega[i+1]
+
+        if t1 == t0:
+            return az0, w0
+
+        a = (t_query - t0)/(t1 - t0)
+        return az0 + a*(az1-az0), w0 + a*(w1-w0)
+
+
+# =========================
+# Blade kinematics
+# =========================
+def blade_kinematics(psi, omega, center):
+    x = ROTOR_RADIUS * np.cos(psi)
+    y = ROTOR_RADIUS * np.sin(psi)
+    pos = center + np.array([x, y, 0.0])
+
+    vx = -omega * ROTOR_RADIUS * np.sin(psi)
+    vy =  omega * ROTOR_RADIUS * np.cos(psi)
+    vel = np.array([vx, vy, 0.0])
+    return pos, vel
+
+
+# =========================
+# Lowson rotating dipole (scalar version)
+# =========================
+def lowson_pressure(obs_pos, src_pos, psi, omega, L0=1.0):
+    """
+    Single-point Lowson near-field dipole.
+    """
+    r = obs_pos - src_pos          # (3,)
+    rmag = np.linalg.norm(r)
+    if rmag < 1e-9:
+        return 0.0, 1e-9
+    rhat = r / rmag
+
+    # Mach magnitude
+    M = omega * ROTOR_RADIUS / SPEED_OF_SOUND
+
+    # Rotating Mach vector M_i
+    Mi = np.array([
+        -M * np.sin(psi),
+         M * np.cos(psi),
+         0.0
+    ])
+
+    # Dipole force direction Fi (vertical)
+    Fi = np.array([0.0, 0.0, L0])
+
+    Mr   = np.dot(rhat, Mi)
+    Fr   = np.dot(rhat, Fi)
+    FiMi = np.dot(Fi, Mi)
+
+    num   = Fr * (1 - M**2) / (1 - Mr + 1e-12) - FiMi
+    denom = (1 - Mr + 1e-12)**2 * (rmag**2 + 1e-12)
+
+    p_near = (0.25/np.pi) * (num / denom)
+    return p_near, rmag
+
+
+# =========================
+# Retarded time solver (per source)
+# =========================
+def solve_retarded_time(t_obs, observer, hist, center, psi_offset, n_iter=3):
+    t_r = t_obs
+    for _ in range(n_iter):
+        az, _ = hist.at(t_r)
+        psi = az + psi_offset
+        pos, _ = blade_kinematics(psi, 0.0, center)
+        R = np.linalg.norm(observer - pos)
+        t_r = t_obs - R / SPEED_OF_SOUND
+    return t_r
+
+
+# =========================
+# Main: Version A (1-D)
+# =========================
+if __name__ == "__main__":
+    # 1) Build rotor histories
+    rotor_hist = [AzimuthHistory() for _ in range(N_ROTORS)]
+
+    t = 0.0
+    while t < T_TOTAL:
+        rpm = 300.0   # constant RPM; change to ramp if you like
+        omega = rpm * 2*np.pi/60.0
+        for r in range(N_ROTORS):
+            rotor_hist[r].update(t, omega)
+        t += DT_SIM
+
+    # 2) Geometry & phase offsets
+    rotor_centers = [
+        np.array([ 5.0,  5.0, 0.0]),
+        np.array([-5.0,  5.0, 0.0]),
+        np.array([-5.0, -5.0, 0.0]),
+        np.array([ 5.0, -5.0, 0.0]),
+    ]
+    hub_phase = [0.0, np.pi/2, np.pi, 3*np.pi/2]  # example hub offsets
+
+    # blade list: (rotor_id, blade_phase_total, center)
+    blade_info = []
+    for r in range(N_ROTORS):
+        for b in range(N_BLADES):
+            blade_phase = 2*np.pi * b / N_BLADES
+            total_phase = hub_phase[r] + blade_phase
+            blade_info.append((r, total_phase, rotor_centers[r]))
+
+    observer = np.array([0.0, 0.0, 0.0])
+
+    # =========================
+    # SOURCE-TIME PATH
+    # =========================
+    t_s = np.arange(0.0, T_TOTAL, DT_SIM)
+
+    per_source_tobs = []
+    per_source_p    = []
+
+    t0_src_build = time.perf_counter()
+
+    for (r, psi_offset, center) in blade_info:
+        hist = rotor_hist[r]
+        t_obs_list = []
+        p_list     = []
+
+        for ts in t_s:
+            az, omega = hist.at(ts)
+            psi = az + psi_offset
+            pos, _ = blade_kinematics(psi, omega, center)
+            p, R = lowson_pressure(observer, pos, psi, omega, L0=1.0)
+            t_obs = ts + R / SPEED_OF_SOUND
+
+            t_obs_list.append(t_obs)
+            p_list.append(p)
+
+        t_obs_arr = np.array(t_obs_list)
+        p_arr     = np.array(p_list)
+
+        sort_idx = np.argsort(t_obs_arr)
+        per_source_tobs.append(t_obs_arr[sort_idx])
+        per_source_p.append(p_arr[sort_idx])
+
+    t1_src_build = time.perf_counter()
+
+    # find common observer-time window
+    starts = [arr[0] for arr in per_source_tobs]
+    ends   = [arr[-1] for arr in per_source_tobs]
+    tmin = max(starts)
+    tmax = min(ends)
+
+    N_OBS = 4096
+    t_obs_uniform = np.linspace(tmin, tmax, N_OBS)
+
+    # interpolate & sum
+    p_src_uniform = np.zeros_like(t_obs_uniform)
+
+    t0_src_interp = time.perf_counter()
+
+    for s in range(N_SOURCES):
+        t_arr = np.asarray(per_source_tobs[s]).ravel()
+        p_arr = np.asarray(per_source_p[s]).ravel()
+        p_src_uniform += np.interp(t_obs_uniform, t_arr, p_arr)
+
+    t1_src_interp = time.perf_counter()
+
+    T_src_build  = t1_src_build  - t0_src_build
+    T_src_interp = t1_src_interp - t0_src_interp
+    T_src_total  = T_src_build + T_src_interp
+
+    # =========================
+    # OBSERVER-TIME PATH
+    # =========================
+    p_obs_uniform = np.zeros_like(t_obs_uniform)
+
+    t0_obs_total = time.perf_counter()
+
+    for i, t_obs in enumerate(t_obs_uniform):
+        p_sum = 0.0
+        for (r, psi_offset, center) in blade_info:
+            hist = rotor_hist[r]
+
+            # retarded time
+            t_r = solve_retarded_time(t_obs, observer, hist, center, psi_offset, n_iter=3)
+
+            az_r, omega_r = hist.at(t_r)
+            psi_r = az_r + psi_offset
+            pos_r, _ = blade_kinematics(psi_r, omega_r, center)
+            p_r, _ = lowson_pressure(observer, pos_r, psi_r, omega_r, L0=1.0)
+
+            p_sum += p_r
+        p_obs_uniform[i] = p_sum
+
+    t1_obs_total = time.perf_counter()
+    T_obs_total  = t1_obs_total - t0_obs_total
+
+    # =========================
+    # Compare signals
+    # =========================
+    diff = p_src_uniform - p_obs_uniform
+    rms_diff = np.sqrt(np.mean(diff**2))
+    rel_rms = rms_diff / (np.sqrt(np.mean(p_src_uniform**2)) + 1e-12)
+
+    print("\n==== TIMING (Version A, 1-D total pressure) ====")
+    print(f"Source-time: build   : {T_src_build:.6f} s")
+    print(f"Source-time: interp  : {T_src_interp:.6f} s")
+    print(f"Source-time: TOTAL   : {T_src_total:.6f} s")
+    print(f"Observer-time: TOTAL : {T_obs_total:.6f} s")
+    print("\n==== NUMERICAL DIFFERENCE ====")
+    print(f"RMS diff (Pa, rel)   : {rms_diff:.3e}  (rel = {rel_rms:.3e})")
+
+    # quick plots
+    plt.figure(figsize=(10,6))
+    plt.plot(t_obs_uniform, p_src_uniform, label="Source-time (interp)")
+    plt.plot(t_obs_uniform, p_obs_uniform, '--', label="Observer-time (retarded)")
+    plt.xlabel("Observer time [s]")
+    plt.ylabel("Pressure (relative)")
+    plt.title("Version A: Total Pressure Comparison")
+    plt.legend()
+    plt.grid(True)
+
+    plt.figure(figsize=(10,4))
+    plt.plot(t_obs_uniform, diff)
+    plt.xlabel("Observer time [s]")
+    plt.ylabel("p_src - p_obs")
+    plt.title("Pressure Difference")
+    plt.grid(True)
+
+    plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
 
 # =========================
 # Constants & config
