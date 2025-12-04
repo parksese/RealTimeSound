@@ -562,3 +562,331 @@ if __name__ == "__main__":
     plt.grid(True)
 
     plt.show()
+    
+    
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+
+# =========================
+# Constants & config
+# =========================
+SPEED_OF_SOUND = 340.0
+ROTOR_RADIUS   = 3.0
+DT_SIM         = 0.0005
+T_TOTAL        = 0.5
+
+N_ROTORS = 4
+N_BLADES = 5
+N_SPAN   = 6   # spanwise discretization per blade
+
+# spanwise radii (avoid exact root)
+SPAN_RADII = np.linspace(0.3 * ROTOR_RADIUS, ROTOR_RADIUS, N_SPAN)
+
+# total "sources" = rotor × blade × span
+N_ELEMENTS = N_ROTORS * N_BLADES * N_SPAN
+
+
+# =========================
+# Azimuth history per rotor
+# =========================
+class AzimuthHistory:
+    def __init__(self):
+        self.times = []
+        self.az    = []
+        self.omega = []
+        self.az_current = 0.0
+
+    def update(self, t, omega):
+        if self.times:
+            dt = t - self.times[-1]
+            self.az_current += self.omega[-1] * dt
+        self.times.append(float(t))
+        self.az.append(float(self.az_current))
+        self.omega.append(float(omega))
+
+    def at_fast(self, t_query):
+        """
+        Faster version assuming uniform time step ~ DT_SIM.
+        Returns (az, omega) at t_query via direct index interpolation.
+        """
+        times = self.times
+        N = len(times)
+        if N < 2:
+            return self.az[-1], self.omega[-1]
+
+        t0 = times[0]
+        dt = times[1] - times[0]  # assumed ~ DT_SIM
+
+        # index in [0, N-1]
+        idx_float = (t_query - t0) / dt
+
+        if idx_float <= 0:
+            return self.az[0], self.omega[0]
+        if idx_float >= N - 1:
+            return self.az[-1], self.omega[-1]
+
+        i0 = int(idx_float)
+        alpha = idx_float - i0
+
+        az0, az1 = self.az[i0], self.az[i0+1]
+        w0,  w1  = self.omega[i0], self.omega[i0+1]
+
+        az = az0 + alpha * (az1 - az0)
+        w  = w0  + alpha * (w1  - w0)
+        return az, w
+
+
+# =========================
+# Blade kinematics
+# =========================
+def blade_kinematics(psi, omega, center, radius):
+    """
+    Position and velocity of a spanwise element at given radius.
+    """
+    x = radius * np.cos(psi)
+    y = radius * np.sin(psi)
+    pos = center + np.array([x, y, 0.0])
+
+    vx = -omega * radius * np.sin(psi)
+    vy =  omega * radius * np.cos(psi)
+    vel = np.array([vx, vy, 0.0])
+    return pos, vel
+
+
+# =========================
+# Lowson rotating dipole (scalar)
+# =========================
+def lowson_pressure(obs_pos, src_pos, psi, omega, radius, L0=1.0):
+    """
+    Single-point Lowson near-field dipole for one spanwise element.
+    """
+    r = obs_pos - src_pos
+    rmag = np.linalg.norm(r)
+    if rmag < 1e-9:
+        return 0.0, 1e-9
+    rhat = r / rmag
+
+    # Mach number at this radius
+    M = omega * radius / SPEED_OF_SOUND
+
+    # rotating Mach vector
+    Mi = np.array([
+        -M * np.sin(psi),
+         M * np.cos(psi),
+         0.0
+    ])
+
+    # dipole force direction (vertical)
+    Fi = np.array([0.0, 0.0, L0])
+
+    Mr   = np.dot(rhat, Mi)
+    Fr   = np.dot(rhat, Fi)
+    FiMi = np.dot(Fi, Mi)
+
+    num   = Fr * (1 - M**2) / (1 - Mr + 1e-12) - FiMi
+    denom = (1 - Mr + 1e-12)**2 * (rmag**2 + 1e-12)
+
+    p_near = (0.25/np.pi) * (num / denom)
+    return p_near, rmag
+
+
+# =========================
+# Retarded time solver (per element)
+# =========================
+def solve_retarded_time(t_obs, observer, hist, center, psi_offset, radius, n_iter=3):
+    """
+    Solve t_obs = t_r + R(t_r)/c for one (rotor, blade, span) element.
+    Uses fixed-point iteration with fast azimuth lookup.
+    """
+    t_r = t_obs
+    for _ in range(n_iter):
+        az, _ = hist.at_fast(t_r)
+        psi = az + psi_offset
+        pos, _ = blade_kinematics(psi, 0.0, center, radius)
+        R = np.linalg.norm(observer - pos)
+        t_r = t_obs - R / SPEED_OF_SOUND
+    return t_r
+
+
+# =========================
+# MAIN (Version A with spans)
+# =========================
+if __name__ == "__main__":
+    # 1) Build rotor histories
+    rotor_hist = [AzimuthHistory() for _ in range(N_ROTORS)]
+
+    t = 0.0
+    while t < T_TOTAL:
+        rpm = 300.0
+        omega = rpm * 2.0 * np.pi / 60.0
+        for r in range(N_ROTORS):
+            rotor_hist[r].update(t, omega)
+        t += DT_SIM
+
+    # 2) Geometry & phase offsets
+    rotor_centers = [
+        np.array([ 5.0,  5.0, 0.0]),
+        np.array([-5.0,  5.0, 0.0]),
+        np.array([-5.0, -5.0, 0.0]),
+        np.array([ 5.0, -5.0, 0.0]),
+    ]
+    hub_phase = [0.0, np.pi/2, np.pi, 3*np.pi/2]
+
+    # Each element: (rotor_id, psi_offset, center, radius)
+    element_info = []
+    for r in range(N_ROTORS):
+        center = rotor_centers[r]
+        for b in range(N_BLADES):
+            blade_phase = 2.0 * np.pi * b / N_BLADES
+            psi0 = hub_phase[r] + blade_phase
+            for s in range(N_SPAN):
+                radius = SPAN_RADII[s]
+                element_info.append((r, psi0, center, radius))
+
+    observer = np.array([0.0, 0.0, 0.0])
+
+    # =========================
+    # SOURCE-TIME PATH
+    # =========================
+    t_s = np.arange(0.0, T_TOTAL, DT_SIM)
+
+    per_elem_tobs = []
+    per_elem_p    = []
+
+    t0_src_build = time.perf_counter()
+
+    for (r, psi_offset, center, radius) in element_info:
+        hist = rotor_hist[r]
+
+        t_obs_list = []
+        p_list     = []
+
+        for ts in t_s:
+            az, omega = hist.at_fast(ts)
+            psi = az + psi_offset
+            pos, _ = blade_kinematics(psi, omega, center, radius)
+            p, R = lowson_pressure(observer, pos, psi, omega, radius, L0=1.0)
+            t_obs = ts + R / SPEED_OF_SOUND
+
+            t_obs_list.append(t_obs)
+            p_list.append(p)
+
+        t_obs_arr = np.array(t_obs_list)
+        p_arr     = np.array(p_list)
+
+        # often monotonic, but we keep sort for safety
+        if np.all(np.diff(t_obs_arr) >= 0):
+            per_elem_tobs.append(t_obs_arr)
+            per_elem_p.append(p_arr)
+        else:
+            idx = np.argsort(t_obs_arr)
+            per_elem_tobs.append(t_obs_arr[idx])
+            per_elem_p.append(p_arr[idx])
+
+    t1_src_build = time.perf_counter()
+
+    # common observer-time window
+    starts = [arr[0] for arr in per_elem_tobs]
+    ends   = [arr[-1] for arr in per_elem_tobs]
+    tmin = max(starts)
+    tmax = min(ends)
+
+    N_OBS = 4096
+    t_obs_uniform = np.linspace(tmin, tmax, N_OBS)
+
+    # interpolate & sum
+    p_src_uniform = np.zeros_like(t_obs_uniform)
+
+    t0_src_interp = time.perf_counter()
+
+    for e in range(N_ELEMENTS):
+        t_arr = np.asarray(per_elem_tobs[e]).ravel()
+        p_arr = np.asarray(per_elem_p[e]).ravel()
+        p_src_uniform += np.interp(t_obs_uniform, t_arr, p_arr)
+
+    t1_src_interp = time.perf_counter()
+
+    T_src_build  = t1_src_build  - t0_src_build
+    T_src_interp = t1_src_interp - t0_src_interp
+    T_src_total  = T_src_build + T_src_interp
+
+    # =========================
+    # OBSERVER-TIME PATH
+    # =========================
+    p_obs_uniform = np.zeros_like(t_obs_uniform)
+
+    t0_obs_total = time.perf_counter()
+
+    for i, t_obs in enumerate(t_obs_uniform):
+        p_sum = 0.0
+        for (r, psi_offset, center, radius) in element_info:
+            hist = rotor_hist[r]
+
+            # retarded time for this element
+            t_r = solve_retarded_time(t_obs, observer, hist, center, psi_offset, radius, n_iter=3)
+
+            # final evaluation at t_r
+            az_r, omega_r = hist.at_fast(t_r)
+            psi_r = az_r + psi_offset
+            pos_r, _ = blade_kinematics(psi_r, omega_r, center, radius)
+            p_r, _ = lowson_pressure(observer, pos_r, psi_r, omega_r, radius, L0=1.0)
+
+            p_sum += p_r
+
+        p_obs_uniform[i] = p_sum
+
+    t1_obs_total = time.perf_counter()
+    T_obs_total  = t1_obs_total - t0_obs_total
+
+    # =========================
+    # Compare signals
+    # =========================
+    diff = p_src_uniform - p_obs_uniform
+    rms_diff = np.sqrt(np.mean(diff**2))
+    rel_rms = rms_diff / (np.sqrt(np.mean(p_src_uniform**2)) + 1e-12)
+
+    print("\n==== TIMING with 6 span stations (Version A) ====")
+    print(f"Source-time: build   : {T_src_build:.6f} s")
+    print(f"Source-time: interp  : {T_src_interp:.6f} s")
+    print(f"Source-time: TOTAL   : {T_src_total:.6f} s")
+    print(f"Observer-time: TOTAL : {T_obs_total:.6f} s")
+    print("\n==== NUMERICAL DIFFERENCE ====")
+    print(f"RMS diff (Pa, rel)   : {rms_diff:.3e}  (rel = {rel_rms:.3e})")
+
+    # quick plots
+    plt.figure(figsize=(10,6))
+    plt.plot(t_obs_uniform, p_src_uniform, label="Source-time (interp)")
+    plt.plot(t_obs_uniform, p_obs_uniform, '--', label="Observer-time (retarded)")
+    plt.xlabel("Observer time [s]")
+    plt.ylabel("Pressure (relative)")
+    plt.title("Total Pressure Comparison (with 6 spanwise elements)")
+    plt.legend()
+    plt.grid(True)
+
+    plt.figure(figsize=(10,4))
+    plt.plot(t_obs_uniform, diff)
+    plt.xlabel("Observer time [s]")
+    plt.ylabel("p_src - p_obs")
+    plt.title("Pressure Difference")
+    plt.grid(True)
+
+    plt.show()
+
